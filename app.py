@@ -71,6 +71,33 @@ def load_cache(path):
         return json.load(fh)
 
 
+CONFIG_FILE = APP_DIR / "config.json"
+
+
+def load_config():
+    """Load app config. Return {column, start_index} or defaults if not found."""
+    if not CONFIG_FILE.exists():
+        return {"column": "FileName", "start_index": 0}
+    try:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as fh:
+            cfg = json.load(fh)
+            return {
+                "column": cfg.get("column", "FileName"),
+                "start_index": cfg.get("start_index", 0),
+            }
+    except Exception:
+        return {"column": "FileName", "start_index": 0}
+
+
+def save_config(column, start_index):
+    """Save app config."""
+    try:
+        with open(CONFIG_FILE, "w", encoding="utf-8") as fh:
+            json.dump({"column": column, "start_index": start_index}, fh, indent=2)
+    except Exception:
+        pass  # silently ignore config save errors
+
+
 def read_filenames(file_path, column, start):
     """Read filenames from a column starting at row-index `start` (0-based)."""
     if file_path.lower().endswith(".csv"):
@@ -199,6 +226,11 @@ class PDFCrawler:
 
         self._cache_map  = None   # currently active pdf map
         self._cache_path = None   # path to the active json file
+
+        # Load config
+        cfg = load_config()
+        self.var_column.set(cfg["column"])
+        self.var_start.set(str(cfg["start_index"]))
 
         self._build()
 
@@ -402,6 +434,9 @@ class PDFCrawler:
         if not col:
             messagebox.showerror("Missing input", "Enter a column name.")
             return
+
+        # Save config for next time
+        save_config(col, start)
 
         def worker():
             try:
