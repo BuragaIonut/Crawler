@@ -1,6 +1,7 @@
 """PDF Crawler — scan folder · match Excel list · copy most-recent PDFs"""
 
 import os
+import sys
 import json
 import shutil
 import threading
@@ -16,6 +17,15 @@ try:
     HAS_DND = True
 except ImportError:
     HAS_DND = False
+
+
+# ── App Directory (handle frozen executable) ──────────────────────────────────
+if getattr(sys, 'frozen', False):
+    # Running as compiled executable
+    APP_DIR = Path(sys.executable).parent
+else:
+    # Running as script
+    APP_DIR = Path(__file__).parent
 
 
 # ── Palette ───────────────────────────────────────────────────────────────────
@@ -34,7 +44,6 @@ C = {
     "input":   "#0f172a",
 }
 
-APP_DIR   = Path(__file__).parent
 CACHE_DIR = APP_DIR / "cache"
 
 
