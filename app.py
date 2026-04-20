@@ -84,47 +84,36 @@ CONFIG_FILE = APP_DIR / "config.json"
 
 
 def load_config():
-    """Load app config. Return {column, start_index} or defaults if not found."""
-    if not CONFIG_FILE.exists():
-        return {"column": "FileName", "start_index": 0}
-    try:
-        with open(CONFIG_FILE, "r", encoding="utf-8") as fh:
-            cfg = json.load(fh)
-            return {
-                "column": cfg.get("column", "FileName"),
-                "start_index": cfg.get("start_index", 0),
-            }
-    except Exception:
-        return {"column": "FileName", "start_index": 0}
+    """Load app config. Currently unused but kept for compatibility."""
+    return {}
 
 
-def save_config(column, start_index):
-    """Save app config."""
-    try:
-        with open(CONFIG_FILE, "w", encoding="utf-8") as fh:
-            json.dump({"column": column, "start_index": start_index}, fh, indent=2)
-    except Exception:
-        pass  # silently ignore config save errors
+def save_config():
+    """Save app config. Currently unused but kept for compatibility."""
+    pass
 
 
-def read_filenames(file_path, column, start):
-    """Read filenames from a column starting at row-index `start` (0-based)."""
+def read_filenames(file_path):
+    """Read filenames from Sheet2 (1st sheet), column B, starting from row 4."""
     if file_path.lower().endswith(".csv"):
-        df = pd.read_csv(file_path)
-    else:
-        df = pd.read_excel(file_path)
-    if column not in df.columns:
-        raise ValueError(
-            f"Column '{column}' not found.\nAvailable columns: {list(df.columns)}"
-        )
-    return (
-        df[column]
-        .iloc[start:]
+        raise ValueError("Only Excel files are supported. Expected .xlsx or .xls")
+    
+    # Read the first sheet (Sheet2), skip first 3 rows, get column B (index 1)
+    df = pd.read_excel(file_path, sheet_name=0, header=None)
+    
+    # Get column B (index 1) starting from row 4 (index 3)
+    filenames = (
+        df.iloc[3:, 1]  # Rows 4 onwards (index 3+), Column B (index 1)
         .dropna()
         .astype(str)
         .str.strip()
         .tolist()
     )
+    
+    if not filenames:
+        raise ValueError("No filenames found in Sheet2, Column B, starting from Row 4")
+    
+    return filenames
 
 
 def match_filenames(names, cache):
@@ -224,22 +213,15 @@ class PDFCrawler:
         self.root = root
         self.root.title("PDF Crawler")
         self.root.configure(bg=C["bg"])
-        self.root.geometry("820x860")
-        self.root.minsize(680, 720)
+        self.root.geometry("820x800")
+        self.root.minsize(680, 680)
 
         self.var_source = tk.StringVar()
         self.var_dest   = tk.StringVar()
         self.var_excel  = tk.StringVar()
-        self.var_column = tk.StringVar(value="FileName")
-        self.var_start  = tk.StringVar(value="0")
 
         self._cache_map  = None   # currently active pdf map
         self._cache_path = None   # path to the active json file
-
-        # Load config
-        cfg = load_config()
-        self.var_column.set(cfg["column"])
-        self.var_start.set(str(cfg["start_index"]))
 
         self._build()
 
@@ -286,13 +268,6 @@ class PDFCrawler:
         _section_label(body, "2", "Excel / CSV File",
                        "Drag & drop or use Browse")
         self._build_drop_zone(body)
-
-        meta = tk.Frame(body, bg=C["bg"])
-        meta.pack(fill="x", pady=(8, 14))
-        _label(meta, "Column name:").pack(side="left")
-        _entry(meta, self.var_column, width=24).pack(side="left", padx=(6, 22))
-        _label(meta, "Start row index (0-based):").pack(side="left")
-        _entry(meta, self.var_start, width=7).pack(side="left", padx=(6, 0))
 
         # Step 3 — Destination
         _section_label(body, "3", "Destination Folder",
@@ -423,13 +398,6 @@ class PDFCrawler:
         src  = self.var_source.get().strip()
         dst  = self.var_dest.get().strip()
         xlsx = self.var_excel.get().strip()
-        col  = self.var_column.get().strip()
-
-        try:
-            start = int(self.var_start.get())
-        except ValueError:
-            messagebox.showerror("Invalid input", "Start row must be a whole number.")
-            return
 
         if not os.path.isdir(src):
             messagebox.showerror("Invalid path", "Select a valid source folder.")
@@ -440,12 +408,6 @@ class PDFCrawler:
         if not dst:
             messagebox.showerror("Missing path",  "Select a destination folder.")
             return
-        if not col:
-            messagebox.showerror("Missing input", "Enter a column name.")
-            return
-
-        # Save config for next time
-        save_config(col, start)
 
         def worker():
             try:
@@ -471,9 +433,9 @@ class PDFCrawler:
 
                 # Read spreadsheet
                 self._post(
-                    f"Reading column '{col}' from row {start} in "
+                    f"Reading filenames from Sheet2, Column B (starting Row 4) in "
                     f"{os.path.basename(xlsx)} …", "dim")
-                names = read_filenames(xlsx, col, start)
+                names = read_filenames(xlsx)
                 self._post(f"{len(names)} file names found in spreadsheet.", "hi")
 
                 # Match
