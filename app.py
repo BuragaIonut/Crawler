@@ -117,14 +117,38 @@ def read_filenames(file_path):
 
 
 def match_filenames(names, cache):
-    """Return (found_dict, missing_list)."""
+    """Return (found_dict, missing_list).
+    
+    Matches both exact filenames and partial matches.
+    Example: searching for '2222' will match '2222.pdf', '2222A.pdf', '2222_0.pdf', etc.
+    """
     found, missing = {}, []
     for name in names:
-        key = name.lower() if name.lower().endswith(".pdf") else name.lower() + ".pdf"
-        if key in cache:
-            found[name] = cache[key]
+        # Normalize the search term - remove .pdf if present
+        search_term = name.lower()
+        if search_term.endswith(".pdf"):
+            search_term = search_term[:-4]  # Remove .pdf extension
+        
+        # First try exact match
+        exact_key = search_term + ".pdf"
+        if exact_key in cache:
+            found[name] = cache[exact_key]
         else:
-            missing.append(name)
+            # Try to find PDFs that contain the search term in their filename
+            matched_paths = []
+            for pdf_filename, paths in cache.items():
+                # Remove .pdf extension from the cached filename
+                pdf_name_no_ext = pdf_filename[:-4] if pdf_filename.endswith(".pdf") else pdf_filename
+                
+                # Check if search term is contained in the PDF filename
+                if search_term in pdf_name_no_ext:
+                    matched_paths.extend(paths)
+            
+            if matched_paths:
+                found[name] = matched_paths
+            else:
+                missing.append(name)
+    
     return found, missing
 
 
