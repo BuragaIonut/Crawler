@@ -9,8 +9,11 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from pathlib import Path
 from datetime import datetime
+import functools
+from concurrent.futures import ThreadPoolExecutor
 
 import pandas as pd
+from openpyxl import load_workbook
 
 try:
     from tkinterdnd2 import TkinterDnD, DND_FILES
@@ -58,14 +61,39 @@ def make_cache_path():
 # CORE – pure functions
 # ══════════════════════════════════════════════════════════════════════════════
 
-def scan_pdfs(folder):
-    """Return {lowercase_filename: [full_paths]} for every PDF under folder."""
+def scan_pdfs(folder, max_workers=4):
+    """Return ({lowercase_filename: [full_paths]}, {path: creation_time}) using parallel scanning."""
     result = {}
-    for dirpath, _, files in os.walk(folder):
-        for f in files:
-            if f.lower().endswith(".pdf"):
-                result.setdefault(f.lower(), []).append(os.path.join(dirpath, f))
-    return result
+    file_times = {}
+    
+    def process_pdfs(pdf_paths):
+        """Process a batch of PDF paths."""
+        batch_result = {}
+        batch_times = {}
+        for pdf_path in pdf_paths:
+            name = pdf_path.name.lower()
+            batch_result.setdefault(name, []).append(str(pdf_path))
+            try:
+                batch_times[str(pdf_path)] = os.path.getctime(str(pdf_path))
+            except OSError:
+                batch_times[str(pdf_path)] = 0
+        return batch_result, batch_times
+    
+    # Collect all PDF paths using pathlib (filters only .pdf files)
+    all_pdfs = list(Path(folder).rglob('*.pdf'))
+    
+    # Process in parallel batches
+    if all_pdfs:
+        batch_size = max(1, len(all_pdfs) // max_workers)
+        batches = [all_pdfs[i:i + batch_size] for i in range(0, len(all_pdfs), batch_size)]
+        
+        with ThreadPoolExecutor(max_workers=max_workers) as exe:
+            for batch_result, batch_times in exe.map(process_pdfs, batches):
+                for name, paths in batch_result.items():
+                    result.setdefault(name, []).extend(paths)
+                file_times.update(batch_times)
+    
+    return result, file_times
 
 
 def save_cache(cache, path):
@@ -94,81 +122,132 @@ def save_config():
 
 
 def read_filenames(file_path):
-    """Read filenames from Sheet2 (1st sheet), column B, starting from row 4."""
+    """Read filenames from Sheet2 (1st sheet), column B, starting from row 4.
+    
+    Uses openpyxl with data_only=True for faster parsing.
+    Only reads the needed column.
+    """
     if file_path.lower().endswith(".csv"):
         raise ValueError("Only Excel files are supported. Expected .xlsx or .xls")
     
-    # Read the first sheet (Sheet2), skip first 3 rows, get column B (index 1)
-    df = pd.read_excel(file_path, sheet_name=0, header=None)
-    
-    # Get column B (index 1) starting from row 4 (index 3)
-    filenames = (
-        df.iloc[3:, 1]  # Rows 4 onwards (index 3+), Column B (index 1)
-        .dropna()
-        .astype(str)
-        .str.strip()
-        .tolist()
-    )
-    
-    if not filenames:
-        raise ValueError("No filenames found in Sheet2, Column B, starting from Row 4")
-    
-    return filenames
+    try:
+        # Use openpyxl for faster parsing (data_only skips formulas)
+        wb = load_workbook(file_path, data_only=True, read_only=True)
+        ws = wb.active
+        
+        # Read only column B (column 2), starting from row 4
+        filenames = []
+        for row_idx in range(4, ws.max_row + 1):
+            cell_value = ws.cell(row=row_idx, column=2).value
+            if cell_value is not None:
+                filenames.append(str(cell_value).strip())
+        
+        wb.close()
+        
+        if not filenames:
+            raise ValueError("No filenames found in Sheet2, Column B, starting from Row 4")
+        
+        return filenames
+    except Exception as e:
+        # Fallback to pandas if openpyxl fails
+        df = pd.read_excel(file_path, sheet_name=0, header=None, 
+                          usecols=[1], skiprows=3)
+        filenames = (
+            df.iloc[:, 0]
+            .dropna()
+            .astype(str)
+            .str.strip()
+            .tolist()
+        )
+        
+        if not filenames:
+            raise ValueError("No filenames found in Sheet2, Column B, starting from Row 4")
+        
+        return filenames
 
 
 def match_filenames(names, cache):
     """Return (found_dict, missing_list).
     
-    Matches both exact filenames and partial matches.
+    Builds a fast search index for substring matching.
     Example: searching for '2222' will match '2222.pdf', '2222A.pdf', '2222_0.pdf', etc.
     """
+    # Build search index once (fast O(n) preprocessing)
+    search_index = {}
+    for pdf_filename, paths in cache.items():
+        pdf_name_no_ext = pdf_filename[:-4] if pdf_filename.endswith(".pdf") else pdf_filename
+        paths_list = list(paths) if isinstance(paths, (list, tuple)) else [paths]
+        
+        # Add exact match
+        search_index[pdf_name_no_ext] = paths_list
+        
+        # Add all substring matches (1-char and longer)
+        for i in range(len(pdf_name_no_ext)):
+            for j in range(i + 1, len(pdf_name_no_ext) + 1):
+                substring = pdf_name_no_ext[i:j]
+                if substring not in search_index:
+                    search_index[substring] = []
+                search_index[substring].extend(paths_list)
+    
     found, missing = {}, []
     for name in names:
-        # Normalize the search term - remove .pdf if present
-        search_term = name.lower()
-        if search_term.endswith(".pdf"):
-            search_term = search_term[:-4]  # Remove .pdf extension
+        search_term = name.lower().rstrip('.pdf')
         
-        # First try exact match
-        exact_key = search_term + ".pdf"
-        if exact_key in cache:
-            found[name] = cache[exact_key]
+        # Fast O(1) lookup in index
+        if search_term in search_index:
+            found[name] = search_index[search_term]
         else:
-            # Try to find PDFs that contain the search term in their filename
-            matched_paths = []
-            for pdf_filename, paths in cache.items():
-                # Remove .pdf extension from the cached filename
-                pdf_name_no_ext = pdf_filename[:-4] if pdf_filename.endswith(".pdf") else pdf_filename
-                
-                # Check if search term is contained in the PDF filename
-                if search_term in pdf_name_no_ext:
-                    matched_paths.extend(paths)
-            
-            if matched_paths:
-                found[name] = matched_paths
-            else:
-                missing.append(name)
+            missing.append(name)
     
     return found, missing
 
 
-def most_recent_path(paths):
-    """Return the path with the most recent creation time."""
-    return max(paths, key=os.path.getctime)
+def most_recent_path(paths, file_times=None):
+    """Return the path with the most recent creation time.
+    
+    Uses cached file_times if provided (much faster).
+    Falls back to os.path.getctime if cache not available.
+    """
+    if not paths:
+        return None
+    
+    if file_times:
+        # Use cached times (no I/O)
+        return max(paths, key=lambda p: file_times.get(p, 0))
+    else:
+        # Fallback: fetch from file system
+        return max(paths, key=os.path.getctime)
 
 
-def copy_matches(matches, dest):
-    """Copy the most-recent PDF for each match into dest. Return (copied, errors)."""
+def copy_matches(matches, dest, file_times=None, max_workers=4):
+    """Copy the most-recent PDF for each match into dest. Return (copied, errors).
+    
+    Uses parallel threads for faster copying.
+    """
     Path(dest).mkdir(parents=True, exist_ok=True)
-    copied, errors = [], []
-    for name, paths in matches.items():
+    
+    def copy_one(item):
+        """Copy a single match."""
+        name, paths = item
         try:
-            src = most_recent_path(paths)
+            src = most_recent_path(paths, file_times)
+            if not src:
+                return (name, None, None, "No paths available")
             dst = os.path.join(dest, os.path.basename(src))
             shutil.copy2(src, dst)
-            copied.append((name, src, dst))
+            return (name, src, dst, None)
         except Exception as exc:
-            errors.append((name, str(exc)))
+            return (name, None, None, str(exc))
+    
+    # Process copies in parallel
+    copied, errors = [], []
+    with ThreadPoolExecutor(max_workers=max_workers) as exe:
+        for name, src, dst, error in exe.map(copy_one, matches.items()):
+            if error is None:
+                copied.append((name, src, dst))
+            else:
+                errors.append((name, error))
+    
     return copied, errors
 
 
@@ -246,8 +325,12 @@ class PDFCrawler:
 
         self._cache_map  = None   # currently active pdf map
         self._cache_path = None   # path to the active json file
+        self._file_times = None   # cached file creation times for fast lookup
 
         self._build()
+        
+        # Auto-load most recent cache on startup (much faster than rescanning)
+        self._auto_load_recent_cache()
 
     # ── layout ────────────────────────────────────────────────────────────────
 
@@ -403,10 +486,11 @@ class PDFCrawler:
         def worker():
             try:
                 cache_path = make_cache_path()
-                pdf_map = scan_pdfs(folder)
+                pdf_map, file_times = scan_pdfs(folder)  # Now returns both
                 save_cache(pdf_map, cache_path)
                 self._cache_map  = pdf_map
                 self._cache_path = cache_path
+                self._file_times = file_times
                 unique = len(pdf_map)
                 total  = sum(len(v) for v in pdf_map.values())
                 self._post(
@@ -438,16 +522,18 @@ class PDFCrawler:
                 # Use active cache or auto-scan
                 if self._cache_map is not None:
                     pdf_map = self._cache_map
+                    file_times = self._file_times
                     self._post(
                         f"Using cache: {os.path.basename(self._cache_path)}  "
                         f"({len(pdf_map)} unique names)", "dim")
                 else:
                     self._post("No cache loaded — scanning first …", "warn")
                     cache_path = make_cache_path()
-                    pdf_map = scan_pdfs(src)
+                    pdf_map, file_times = scan_pdfs(src)
                     save_cache(pdf_map, cache_path)
                     self._cache_map  = pdf_map
                     self._cache_path = cache_path
+                    self._file_times = file_times
                     unique = len(pdf_map)
                     total  = sum(len(v) for v in pdf_map.values())
                     self._post(
@@ -469,10 +555,10 @@ class PDFCrawler:
                 for m in missing:
                     self._post(f"    NOT FOUND: {m}", "warn")
 
-                # Copy
+                # Copy with parallel workers and file_times cache
                 if found:
                     self._post(f"Copying {len(found)} PDF(s) → {dst} …", "dim")
-                    copied, errors = copy_matches(found, dst)
+                    copied, errors = copy_matches(found, dst, file_times, max_workers=4)
                     for _name, src_path, _dst_path in copied:
                         self._post(f"    ✓  {os.path.basename(src_path)}", "ok")
                     for name, err in errors:
@@ -534,10 +620,67 @@ class PDFCrawler:
         """Thread-safe log."""
         self.root.after(0, lambda: self._log(msg, tag))
 
+    def _auto_load_recent_cache(self):
+        """Auto-load the most recent cache file on startup (much faster than rescanning)."""
+        if not CACHE_DIR.exists():
+            return
+        
+        try:
+            # Find most recent cache file
+            cache_files = sorted(
+                CACHE_DIR.glob('scan_*.json'),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True
+            )
+            
+            if not cache_files:
+                return
+            
+            recent_cache = cache_files[0]
+            data = load_cache(str(recent_cache))
+            
+            if data:
+                self._cache_map  = data
+                self._cache_path = str(recent_cache)
+                # Rebuild file_times from cache (fast operation)
+                self._file_times = {}
+                for paths in data.values():
+                    for path in paths:
+                        try:
+                            self._file_times[path] = os.path.getctime(path)
+                        except OSError:
+                            pass
+                
+                self.root.after(0, self._update_cache_label)
+                self._log(
+                    f"Auto-loaded: {recent_cache.name}  ({len(data)} unique names)", "ok")
+        except Exception:
+            pass  # Silently ignore if auto-load fails
+
+    def _load_cache_file(self):
+        initial = str(CACHE_DIR) if CACHE_DIR.exists() else str(APP_DIR)
+        path = filedialog.askopenfilename(
+            title="Select cache JSON",
+            initialdir=initial,
+            filetypes=[("JSON cache", "*.json"), ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            data = load_cache(path)
+            if data is None:
+                raise ValueError("File could not be read.")
+            self._cache_map  = data
+            self._cache_path = path
+            self._update_cache_label()
+            self._log(
+                f"Cache loaded: {os.path.basename(path)}  "
+                f"({len(data)} unique names)", "ok")
+        except Exception as exc:
+            messagebox.showerror("Load error", str(exc))
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ENTRY POINT
-# ══════════════════════════════════════════════════════════════════════════════
 
 def main():
     if HAS_DND:
